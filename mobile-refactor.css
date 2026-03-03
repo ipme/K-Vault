@@ -760,6 +760,54 @@ html[data-theme="dark"] {
     margin-left: 0 !important;
     margin-right: 0 !important;
   }
+
+  /* 管理后台移动端：顶部导航不固定，避免遮挡内容 */
+  .header-content {
+    position: static !important;
+    top: auto !important;
+    left: auto !important;
+    right: auto !important;
+  }
+
+  .el-main.main-container {
+    margin-top: 10px !important;
+  }
+
+  /* 移动端批量工具栏：固定底部单行，防止滚动时异常放大 */
+  .batch-toolbar {
+    left: 8px !important;
+    right: 8px !important;
+    bottom: calc(env(safe-area-inset-bottom) + 10px) !important;
+    width: auto !important;
+    max-width: none !important;
+    height: 52px !important;
+    min-height: 52px !important;
+    max-height: 52px !important;
+    padding: 8px 10px !important;
+    border-radius: 14px !important;
+    box-sizing: border-box !important;
+    display: flex !important;
+    align-items: center !important;
+    white-space: nowrap !important;
+    flex-wrap: nowrap !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .batch-toolbar .batch-actions {
+    display: inline-flex !important;
+    flex-wrap: nowrap !important;
+  }
+
+  .batch-toolbar .batch-btn,
+  .batch-toolbar .batch-count {
+    flex: 0 0 auto;
+  }
+
+  .batch-toolbar .batch-shortcuts {
+    display: none !important;
+  }
 }
 
 @media (pointer: coarse) {

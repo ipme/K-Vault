@@ -448,20 +448,24 @@
                 <span>KV</span>
               </div>
               <div class="status-item">
-                <i class="fas fa-circle" :style="{ color: systemStatus.r2.connected ? '#67c23a' : (systemStatus.r2.message === '未配置' ? '#909399' : '#f56c6c') }"></i>
+                <i class="fas fa-circle" :style="{ color: systemStatus.r2.connected ? '#67c23a' : (isUnconfiguredStatus(systemStatus.r2) ? '#909399' : '#f56c6c') }"></i>
                 <span>R2</span>
               </div>
               <div class="status-item">
-                <i class="fas fa-circle" :style="{ color: systemStatus.s3.connected ? '#67c23a' : (systemStatus.s3.message === '未配置' ? '#909399' : '#f56c6c') }"></i>
+                <i class="fas fa-circle" :style="{ color: systemStatus.s3.connected ? '#67c23a' : (isUnconfiguredStatus(systemStatus.s3) ? '#909399' : '#f56c6c') }"></i>
                 <span>S3</span>
               </div>
               <div class="status-item">
-                <i class="fas fa-circle" :style="{ color: systemStatus.discord.connected ? '#67c23a' : (systemStatus.discord.message === '未配置' ? '#909399' : '#f56c6c') }"></i>
+                <i class="fas fa-circle" :style="{ color: systemStatus.discord.connected ? '#67c23a' : (isUnconfiguredStatus(systemStatus.discord) ? '#909399' : '#f56c6c') }"></i>
                 <span>DC</span>
               </div>
               <div class="status-item">
-                <i class="fas fa-circle" :style="{ color: systemStatus.huggingface.connected ? '#67c23a' : (systemStatus.huggingface.message === '未配置' ? '#909399' : '#f56c6c') }"></i>
+                <i class="fas fa-circle" :style="{ color: systemStatus.huggingface.connected ? '#67c23a' : (isUnconfiguredStatus(systemStatus.huggingface) ? '#909399' : '#f56c6c') }"></i>
                 <span>HF</span>
+              </div>
+              <div class="status-item">
+                <i class="fas fa-circle" :style="{ color: systemStatus.github.connected ? '#67c23a' : (isUnconfiguredStatus(systemStatus.github) ? '#909399' : '#f56c6c') }"></i>
+                <span>GH</span>
               </div>
             </div>
             <el-dropdown @command="handleLoadSettings" :hide-on-click="false">
@@ -865,7 +869,7 @@
       isLoadingMore: false,
       search: '',
       currentPage: 1,
-      pageSize: 15,
+      pageSize: 100,
       selectedFiles: [],
       sortOption: 'dateDesc',
       filterOption: 'all',
@@ -878,6 +882,10 @@
       folderMutating: false,
       folderMutatingAction: '',
       listRequestSeq: 0,
+      isMobileViewport: false,
+      folderListCache: {},
+      folderCacheTTL: 3 * 60 * 1000,
+      folderCacheMaxEntries: 12,
       dragState: {
         active: false,
         fileIds: [],
@@ -894,6 +902,7 @@
         s3: { connected: false, message: '检查中...', enabled: false },
         discord: { connected: false, message: '检查中...', enabled: false },
         huggingface: { connected: false, message: '检查中...', enabled: false },
+        github: { connected: false, message: '检查中...', enabled: false },
         auth: { enabled: false, message: '检查中...' }
       },
       batchToolbarPosition: {
@@ -1033,6 +1042,9 @@
         return list.concat(nodes);
       },
       batchToolbarStyle() {
+        if (this.isMobileViewport) {
+          return {};
+        }
         if (this.batchToolbarPosition.left === null || this.batchToolbarPosition.top === null) {
           return {};
         }
@@ -1053,6 +1065,11 @@
       },
       selectedFiles(newValue) {
         if (newValue.length === 0) {
+          this.batchToolbarPosition.left = null;
+          this.batchToolbarPosition.top = null;
+          return;
+        }
+        if (this.isMobileViewport) {
           this.batchToolbarPosition.left = null;
           this.batchToolbarPosition.top = null;
           return;
@@ -1080,6 +1097,93 @@
           output.push(piece);
         });
         return output.join('/');
+      },
+      isUnconfiguredStatus(item = {}) {
+        const message = String(item?.message || '').trim().toLowerCase();
+        return message === '未配置' || message === 'not configured' || message.includes('not configured');
+      },
+      updateViewportFlags() {
+        this.isMobileViewport = window.matchMedia('(max-width: 900px)').matches;
+        if (this.isMobileViewport) {
+          this.batchToolbarPosition.left = null;
+          this.batchToolbarPosition.top = null;
+          this.batchDragState.dragging = false;
+        }
+      },
+      restoreFolderCache() {
+        try {
+          const raw = localStorage.getItem('adminFolderListCache');
+          const parsed = raw ? JSON.parse(raw) : {};
+          this.folderListCache = parsed && typeof parsed === 'object' ? parsed : {};
+          this.pruneFolderCache();
+        } catch {
+          this.folderListCache = {};
+        }
+      },
+      persistFolderCache() {
+        try {
+          localStorage.setItem('adminFolderListCache', JSON.stringify(this.folderListCache));
+        } catch {
+          // ignore storage quota errors
+        }
+      },
+      pruneFolderCache() {
+        const now = Date.now();
+        const entries = Object.entries(this.folderListCache || {})
+          .filter(([, value]) => value && Number.isFinite(Number(value.time)) && (now - Number(value.time) <= this.folderCacheTTL))
+          .sort((a, b) => Number(b[1].time || 0) - Number(a[1].time || 0))
+          .slice(0, this.folderCacheMaxEntries);
+        this.folderListCache = Object.fromEntries(entries);
+      },
+      getFolderCacheKey() {
+        const folder = this.normalizeFolderPath(this.folderPath || '');
+        const storage = String(this.storageFilter || 'all').toLowerCase();
+        return `${storage}::${folder}`;
+      },
+      cloneRowsForCache(rows = []) {
+        return rows.map((item) => ({
+          ...item,
+          selected: false,
+          metadata: { ...(item.metadata || {}) },
+        }));
+      },
+      readFolderCache(cacheKey) {
+        const entry = this.folderListCache?.[cacheKey];
+        if (!entry) return null;
+        if (!Number.isFinite(Number(entry.time)) || (Date.now() - Number(entry.time) > this.folderCacheTTL)) {
+          delete this.folderListCache[cacheKey];
+          this.persistFolderCache();
+          return null;
+        }
+        return entry;
+      },
+      applyFolderCacheEntry(entry) {
+        if (!entry) return;
+        this.tableData = this.cloneRowsForCache(entry.rows || []);
+        this.nextCursor = entry.nextCursor || null;
+        this.totalCount = Number.isFinite(entry.totalCount) ? Number(entry.totalCount) : this.tableData.length;
+        this.updateStats();
+        this.calculatePageSize();
+        this.sortData(this.tableData);
+      },
+      writeFolderCache(cacheKey) {
+        if (!cacheKey) return;
+        this.folderListCache[cacheKey] = {
+          time: Date.now(),
+          rows: this.cloneRowsForCache(this.tableData),
+          nextCursor: this.nextCursor,
+          totalCount: this.totalCount,
+        };
+        this.pruneFolderCache();
+        this.persistFolderCache();
+      },
+      clearFolderCache() {
+        this.folderListCache = {};
+        try {
+          localStorage.removeItem('adminFolderListCache');
+        } catch {
+          // ignore
+        }
       },
       getStorageType(name = '') {
         if (String(name).startsWith('r2:')) return 'r2';
@@ -1183,7 +1287,7 @@
         if (normalized === this.folderPath && this.tableData.length > 0) return;
         this.folderPath = normalized;
         this.currentPage = 1;
-        await this.refreshFileList();
+        await this.refreshFileList({ preferCache: true });
       },
       async fetchFolders() {
         this.folderLoading = true;
@@ -1205,7 +1309,8 @@
       },
       async refreshFolderResources(showMessage = true) {
         try {
-          await Promise.all([this.fetchFolders(), this.refreshFileList()]);
+          this.clearFolderCache();
+          await Promise.all([this.fetchFolders(), this.refreshFileList({ force: true })]);
           if (showMessage) {
             this.$message.success('目录与文件已刷新');
           }
@@ -1257,6 +1362,7 @@
             if (!response?.success) throw new Error(response?.error || '目录创建失败');
 
             this.$message.success('目录创建成功');
+            this.clearFolderCache();
             await Promise.all([this.fetchFolders(), this.refreshFileList()]);
           } catch (error) {
             this.folders = previousFolders;
@@ -1304,6 +1410,7 @@
 
             if (!res?.success) throw new Error(res?.error || '重命名失败');
             this.$message.success('目录重命名成功');
+            this.clearFolderCache();
             await Promise.all([this.fetchFolders(), this.refreshFileList()]);
           } catch (error) {
             this.folders = previousFolders;
@@ -1347,6 +1454,7 @@
             }).then((r) => r.json());
 
             if (!response?.success) throw new Error(response?.error || '删除目录失败');
+            this.clearFolderCache();
             await Promise.all([this.fetchFolders(), this.refreshFileList()]);
             this.$message.success('目录删除成功');
           } catch (error) {
@@ -1446,6 +1554,7 @@
           }).then((r) => r.json());
           if (!result.success) throw new Error(result.error || '移动失败');
           this.$message.success(`已移动 ${result.moved || 0} 个文件到 ${targetFolderPath || '根目录'}`);
+          this.clearFolderCache();
           await this.fetchFolders();
         } catch (error) {
           if (error !== 'cancel' && error !== 'close') {
@@ -1647,6 +1756,7 @@
           if (!result.success) throw new Error(result.error || '拖拽移动失败');
           const folderLabel = targetFolderPath || '根目录';
           this.$message.success(`已移动 ${result.moved || 0} 个文件到 ${folderLabel}`);
+          this.clearFolderCache();
           await this.fetchFolders();
         } catch (error) {
           this.tableData = previousRows;
@@ -1663,6 +1773,7 @@
         this.tableData.forEach(file => file.selected = false);
       },
       startBatchDrag(event) {
+        if (this.isMobileViewport) return;
         if (event.button !== 0) return;
         const toolbar = this.$refs.batchToolbar;
         if (!toolbar) return;
@@ -1690,6 +1801,7 @@
         this.batchToolbarPosition.top = top;
       },
       stopBatchDrag() {
+        if (this.isMobileViewport) return;
         if (!this.batchDragState.dragging) return;
         this.batchDragState.dragging = false;
         document.removeEventListener('mousemove', this.onBatchDrag);
@@ -1697,6 +1809,11 @@
         this.snapBatchToolbarToBottom();
       },
       snapBatchToolbarToBottom() {
+        if (this.isMobileViewport) {
+          this.batchToolbarPosition.left = null;
+          this.batchToolbarPosition.top = null;
+          return;
+        }
         const toolbar = this.$refs.batchToolbar;
         if (!toolbar) return;
         const padding = 12;
@@ -1869,12 +1986,24 @@
         this.tableData = Array.from(map.values());
       },
       getListRequestLimit(forLoadMore = false) {
-        const base = this.viewMode === 'list' ? 40 : 24;
-        const videoPenalty = this.fileType === 'video' ? 8 : 0;
-        const dataSaverPenalty = this.loadMode === 'dataSaver' ? 6 : 0;
-        const grow = forLoadMore ? 12 : 0;
-        const limit = base + grow - videoPenalty - dataSaverPenalty;
-        return Math.max(12, Math.min(80, limit));
+        return forLoadMore ? 1000 : 100;
+      },
+      buildListQueryParams({ cursor = null, limit = null, includeStats = true } = {}) {
+        const params = new URLSearchParams();
+        if (cursor !== null && cursor !== undefined && cursor !== '') {
+          params.set('cursor', String(cursor));
+        }
+        params.set('limit', String(limit ?? this.getListRequestLimit(false)));
+        if (includeStats) {
+          params.set('includeStats', '1');
+        }
+        // 首屏优先取小文件，先让可见内容更快完成渲染
+        params.set('sort', 'sizeAsc');
+        params.set('folderPath', this.folderPath || '');
+        if (this.storageFilter && this.storageFilter !== 'all') {
+          params.set('storage', this.storageFilter);
+        }
+        return params;
       },
       sort(command) { this.sortOption = command; },  // 切换排序方式
       filter(command) { this.filterOption = command; },  // 切换筛选方式
@@ -1886,27 +2015,49 @@
       async loadMore() {
         if (this.isLoadingMore || !this.nextCursor) return;
         this.isLoadingMore = true;
+        const startCount = this.tableData.length;
         try {
-          const params = new URLSearchParams();
-          params.set('cursor', String(this.nextCursor));
-          params.set('limit', String(this.getListRequestLimit(true)));
-          params.set('includeStats', '1');
-          params.set('folderPath', this.folderPath || '');
-          if (this.storageFilter && this.storageFilter !== 'all') {
-            params.set('storage', this.storageFilter);
-          }
-          const result = await fetch(`./api/manage/list?${params.toString()}`, {
-            method: 'GET',
-            credentials: 'include',
-          }).then((r) => r.json());
+          let cursor = this.nextCursor;
+          let guard = 0;
+          const seenCursors = new Set();
+          while (cursor && guard < 200) {
+            if (seenCursors.has(cursor)) break;
+            seenCursors.add(cursor);
+            const params = this.buildListQueryParams({
+              cursor,
+              limit: this.getListRequestLimit(true),
+              includeStats: true,
+            });
+            const result = await fetch(`./api/manage/list?${params.toString()}`, {
+              method: 'GET',
+              credentials: 'include',
+            }).then((r) => r.json());
 
-          const mapped = (result.keys || []).map((file) => this.normalizeListItem(file));
-          this.mergeListData(mapped);
-          this.nextCursor = result.list_complete ? null : result.cursor;
-          if (Number.isFinite(result?.stats?.total)) {
-            this.totalCount = result.stats.total;
+            const mapped = (result.keys || []).map((file) => this.normalizeListItem(file));
+            this.mergeListData(mapped);
+            cursor = result.list_complete ? null : result.cursor;
+            this.nextCursor = cursor;
+            if (Number.isFinite(result?.stats?.total)) {
+              this.totalCount = result.stats.total;
+            }
+            guard += 1;
           }
           this.updateStats();
+          this.writeFolderCache(this.getFolderCacheKey());
+          if (!this.nextCursor) {
+            const expandedSize = Math.max(
+              this.pageSize,
+              this.filteredTableData.length || this.tableData.length || this.getListRequestLimit(false)
+            );
+            this.pageSize = expandedSize;
+            this.currentPage = 1;
+          }
+          const loaded = Math.max(0, this.tableData.length - startCount);
+          if (this.nextCursor) {
+            this.$message.warning(`数据较多，本次已继续加载 ${loaded} 条，可再次点击加载更多`);
+          } else {
+            this.$message.success(`已加载剩余 ${loaded} 条`);
+          }
         } catch {
           this.$message.error('加载更多失败，请稍后重试');
         } finally {
@@ -1953,7 +2104,8 @@
       },
       calculatePageSize() {  // 设置页面大小
         const config = {
-          minSize: 15, // 最小页面卡片数
+          minSize: 100, // 桌面端每页最少展示数量
+          mobileMinSize: 60, // 移动端每页最少展示数量
           cardWidth: 240,
           ratio: 3/4, // 卡片高宽比
           gap: 20, // 卡片间距
@@ -1966,19 +2118,21 @@
         const width = content?.clientWidth || config.defaultWidth;
         const height = window.innerHeight - (header?.offsetHeight || config.defaultHeaderHeight);
         // 计算行列数
-        const cols = Math.floor(width / (config.cardWidth + config.gap));
-        const cardHeight = (width / cols - config.gap) * config.ratio;
-        const rows = Math.floor(height / (cardHeight + config.gap));
+        const cols = Math.max(1, Math.floor(width / (config.cardWidth + config.gap)));
+        const cardHeight = Math.max(120, (width / cols - config.gap) * config.ratio);
+        const rows = Math.max(1, Math.floor(height / (cardHeight + config.gap)));
+        const minSize = this.isMobileViewport ? config.mobileMinSize : config.minSize;
         // 设置页面大小
-        this.pageSize = Math.max(rows * cols, config.minSize);
+        this.pageSize = Math.max(rows * cols, minSize);
       },
       updateWindowWidth() {  // 动态调整页面大小
         this.windowWidth = window.innerWidth;
         this.calculatePageSize();
       },
       handleWindowResize() {
+        this.updateViewportFlags();
         this.updateWindowWidth();
-        if (this.selectedFiles.length > 0) {
+        if (this.selectedFiles.length > 0 && !this.isMobileViewport) {
           this.$nextTick(() => this.snapBatchToolbarToBottom());
         }
       },
@@ -2090,6 +2244,7 @@
             });
           }
           failed.length && this.$message.error(`上传失败: ${failed.join(', ')}`);
+          this.clearFolderCache();
           this.refreshFileList();
 
         } catch {
@@ -2098,16 +2253,23 @@
         event.target.value = '';
       },
       async refreshFileList(options = {}) {  // 不刷新页面，仅更新数据
-        const { syncFolders = false } = options;
+        const { syncFolders = false, preferCache = false, force = false, silent = false } = options;
+        const cacheKey = this.getFolderCacheKey();
+        if (preferCache && !force) {
+          const cached = this.readFolderCache(cacheKey);
+          if (cached) {
+            this.applyFolderCacheEntry(cached);
+            this.currentPage = 1;
+            this.refreshFileList({ syncFolders, force: true, silent: true }).catch(() => {});
+            return;
+          }
+        }
         const requestSeq = ++this.listRequestSeq;
         try {
-          const params = new URLSearchParams();
-          params.set('limit', String(this.getListRequestLimit(false)));
-          params.set('includeStats', '1');
-          params.set('folderPath', this.folderPath || '');
-          if (this.storageFilter && this.storageFilter !== 'all') {
-            params.set('storage', this.storageFilter);
-          }
+          const params = this.buildListQueryParams({
+            limit: this.getListRequestLimit(false),
+            includeStats: true,
+          });
           const result = await fetch(`./api/manage/list?${params.toString()}`, { method: 'GET', credentials: 'include' })
             .then(response => response.json());
           if (requestSeq !== this.listRequestSeq) return;
@@ -2116,13 +2278,17 @@
           this.nextCursor = result.list_complete ? null : result.cursor;
           this.totalCount = Number.isFinite(result?.stats?.total) ? result.stats.total : mapped.length;
           this.updateStats();
+          this.calculatePageSize();
           this.sortData(this.tableData);
+          this.writeFolderCache(cacheKey);
           if (syncFolders) {
             await this.fetchFolders();
           }
         } catch {
           if (requestSeq !== this.listRequestSeq) return;
-          this.$message.error('刷新文件列表失败，请检查网络连接');
+          if (!silent) {
+            this.$message.error('刷新文件列表失败，请检查网络连接');
+          }
         }
       },
       toggleSelect(index, name) {
@@ -2173,6 +2339,7 @@
                   this.tableData.splice(fileIndex, 1);
                 }
                 this.updateStats();
+                this.clearFolderCache();
                 this.$message.success('删除成功！');
               } else {
                 throw new Error(result.error || '删除失败');
@@ -2391,7 +2558,11 @@
         try {
           const response = await fetch('./api/status', { credentials: 'include' });
           const status = await response.json();
-          this.systemStatus = status;
+          this.systemStatus = {
+            ...this.systemStatus,
+            ...(status || {}),
+            github: status?.github || this.systemStatus.github,
+          };
           loading.close();
           
           // 显示详细状态对话框
@@ -2408,23 +2579,28 @@
                 </span>
               </p>
               <p><i class="fas fa-cloud" style="width: 20px;"></i> <b>R2 存储:</b>
-                <span style="color: ${status.r2.connected ? '#67c23a' : (status.r2.message === '未配置' ? '#909399' : '#f56c6c')}">
-                  ${status.r2.connected ? '✓' : (status.r2.message === '未配置' ? '○' : '✗')} ${status.r2.message}
+                <span style="color: ${status.r2.connected ? '#67c23a' : (this.isUnconfiguredStatus(status.r2) ? '#909399' : '#f56c6c')}">
+                  ${status.r2.connected ? '✓' : (this.isUnconfiguredStatus(status.r2) ? '○' : '✗')} ${status.r2.message}
                 </span>
               </p>
               <p><i class="fas fa-database" style="width: 20px; color: #e6a23c;"></i> <b>S3 存储:</b>
-                <span style="color: ${status.s3?.connected ? '#67c23a' : (status.s3?.message === '未配置' ? '#909399' : '#f56c6c')}">
-                  ${status.s3?.connected ? '✓' : (status.s3?.message === '未配置' ? '○' : '✗')} ${status.s3?.message || '未知'}
+                <span style="color: ${status.s3?.connected ? '#67c23a' : (this.isUnconfiguredStatus(status.s3) ? '#909399' : '#f56c6c')}">
+                  ${status.s3?.connected ? '✓' : (this.isUnconfiguredStatus(status.s3) ? '○' : '✗')} ${status.s3?.message || '未知'}
                 </span>
               </p>
               <p><i class="fab fa-discord" style="width: 20px; color: #7289da;"></i> <b>Discord:</b>
-                <span style="color: ${status.discord?.connected ? '#67c23a' : (status.discord?.message === '未配置' ? '#909399' : '#f56c6c')}">
-                  ${status.discord?.connected ? '✓' : (status.discord?.message === '未配置' ? '○' : '✗')} ${status.discord?.message || '未知'}
+                <span style="color: ${status.discord?.connected ? '#67c23a' : (this.isUnconfiguredStatus(status.discord) ? '#909399' : '#f56c6c')}">
+                  ${status.discord?.connected ? '✓' : (this.isUnconfiguredStatus(status.discord) ? '○' : '✗')} ${status.discord?.message || '未知'}
                 </span>
               </p>
               <p><i class="fas fa-robot" style="width: 20px; color: #ff9d00;"></i> <b>HuggingFace:</b>
-                <span style="color: ${status.huggingface?.connected ? '#67c23a' : (status.huggingface?.message === '未配置' ? '#909399' : '#f56c6c')}">
-                  ${status.huggingface?.connected ? '✓' : (status.huggingface?.message === '未配置' ? '○' : '✗')} ${status.huggingface?.message || '未知'}
+                <span style="color: ${status.huggingface?.connected ? '#67c23a' : (this.isUnconfiguredStatus(status.huggingface) ? '#909399' : '#f56c6c')}">
+                  ${status.huggingface?.connected ? '✓' : (this.isUnconfiguredStatus(status.huggingface) ? '○' : '✗')} ${status.huggingface?.message || '未知'}
+                </span>
+              </p>
+              <p><i class="fab fa-github" style="width: 20px; color: #24292f;"></i> <b>GitHub:</b>
+                <span style="color: ${status.github?.connected ? '#67c23a' : (this.isUnconfiguredStatus(status.github) ? '#909399' : '#f56c6c')}">
+                  ${status.github?.connected ? '✓' : (this.isUnconfiguredStatus(status.github) ? '○' : '✗')} ${status.github?.message || '未知'}
                 </span>
               </p>
               <p><i class="fas fa-lock" style="width: 20px;"></i> <b>身份验证:</b> 
@@ -2723,6 +2899,8 @@
 
       window.addEventListener('resize', this.handleWindowResize);
       window.addEventListener('keydown', this.handleGlobalKeydown);
+      this.restoreFolderCache();
+      this.updateViewportFlags();
       this.updateWindowWidth();
 
       // 恢复设置
@@ -2756,7 +2934,13 @@
       // 检查系统连接状态
       fetch('./api/status', { credentials: 'include' })
         .then(response => response.json())
-        .then(status => { this.systemStatus = status; })
+        .then(status => {
+          this.systemStatus = {
+            ...this.systemStatus,
+            ...(status || {}),
+            github: status?.github || this.systemStatus.github,
+          };
+        })
         .catch(() => {});
 
       // 恢复快捷方式设置

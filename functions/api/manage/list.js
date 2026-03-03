@@ -92,6 +92,15 @@ function compareByTimestampDesc(a, b) {
   return right - left;
 }
 
+function compareByFileSizeAsc(a, b) {
+  const left = Number(a?.metadata?.fileSize || 0);
+  const right = Number(b?.metadata?.fileSize || 0);
+  if (left !== right) return left - right;
+  const leftTs = Number(a?.metadata?.TimeStamp || 0);
+  const rightTs = Number(b?.metadata?.TimeStamp || 0);
+  return rightTs - leftTs;
+}
+
 function computeStats(files) {
   const stats = {
     total: 0,
@@ -222,6 +231,7 @@ export async function onRequest(context) {
   const prefix = url.searchParams.get('prefix') || '';
   const storageFilter = String(url.searchParams.get('storage') || '').toLowerCase();
   const folderFilter = normalizeFolderPath(url.searchParams.get('folderPath') || url.searchParams.get('folder') || '');
+  const sort = String(url.searchParams.get('sort') || '').toLowerCase();
   const includeStats = ['1', 'true', 'yes'].includes(
     String(url.searchParams.get('includeStats') || url.searchParams.get('stats') || '').toLowerCase()
   );
@@ -237,9 +247,13 @@ export async function onRequest(context) {
     .map(normalizeKey)
     .filter((item) => matchStorage(item.metadata?.storageType, storageFilter));
 
+  const sorter = (sort === 'sizeasc' || sort === 'smallfirst')
+    ? compareByFileSizeAsc
+    : compareByTimestampDesc;
+
   const filtered = normalizedFiles
     .filter((item) => matchFolder(item.metadata?.folderPath || '', folderFilter))
-    .sort(compareByTimestampDesc);
+    .sort(sorter);
 
   const page = filtered.slice(offset, offset + limit);
   const nextOffset = offset + limit < filtered.length ? offset + limit : null;
