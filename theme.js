@@ -169,6 +169,7 @@
   var STORAGE_KEY = "kvUiDesignSettings";
   var LEGACY_LOGIN_MODE_KEY = "loginBackgroundMode";
   var LEGACY_LOGIN_URL_KEY = "loginBackgroundUrl";
+  var API_ENDPOINT = "/api/ui-config";
   var EFFECT_STYLES = { none: true, math: true, particle: true, texture: true };
 
   var DEFAULTS = {
@@ -255,7 +256,7 @@
     return next;
   }
 
-  function saveSettings(next) {
+  function saveLocalSettings(next) {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
     } catch (e) {}
@@ -269,6 +270,171 @@
     } catch (e) {
       return normalizeSettings(DEFAULTS);
     }
+  }
+
+  function extractConfigPayload(payload) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return null;
+    }
+
+    var fromData =
+      payload.data && typeof payload.data === "object" && !Array.isArray(payload.data)
+        ? payload.data
+        : null;
+
+    var candidate =
+      payload.config ||
+      payload.settings ||
+      (fromData && (fromData.config || fromData.settings)) ||
+      null;
+
+    if (!candidate && !("success" in payload) && !("error" in payload)) {
+      candidate = payload;
+    }
+
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      return null;
+    }
+    return candidate;
+  }
+
+  function extractErrorMessage(payload, fallback) {
+    if (!payload || typeof payload !== "object") return fallback;
+    if (typeof payload.error === "string" && payload.error) return payload.error;
+    if (payload.error && typeof payload.error === "object") {
+      if (typeof payload.error.message === "string" && payload.error.message) {
+        return payload.error.message;
+      }
+      if (typeof payload.error.detail === "string" && payload.error.detail) {
+        return payload.error.detail;
+      }
+    }
+    if (typeof payload.message === "string" && payload.message) return payload.message;
+    return fallback;
+  }
+
+  function requestUiConfig(method, config) {
+    if (typeof fetch !== "function") {
+      return Promise.reject(new Error("Fetch API is not available"));
+    }
+
+    var init = {
+      method: method,
+      credentials: "include",
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+      },
+    };
+
+    if (method !== "GET" && config) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify({ config: config });
+    }
+
+    return fetch(API_ENDPOINT, init).then(function (response) {
+      return response
+        .text()
+        .then(function (raw) {
+          var payload = {};
+          if (raw) {
+            try {
+              payload = JSON.parse(raw);
+            } catch (e) {
+              payload = {};
+            }
+          }
+
+          if (!response.ok) {
+            var fallback = "Request failed (" + response.status + ")";
+            throw new Error(extractErrorMessage(payload, fallback));
+          }
+
+          return payload;
+        })
+        .catch(function (error) {
+          if (error instanceof Error) throw error;
+          throw new Error(String(error || "Request failed"));
+        });
+    });
+  }
+
+  function syncFromServer(options) {
+    var opts = options || {};
+    var silent = opts.silent !== false;
+    var applyLocalOnFailure = opts.applyLocalOnFailure === true;
+
+    return requestUiConfig("GET")
+      .then(function (payload) {
+        var remote = extractConfigPayload(payload);
+        if (!remote) {
+          return {
+            success: false,
+            source: "local",
+            settings: cloneSettings(settings || readSettings()),
+            error: "Server returned invalid ui config payload",
+          };
+        }
+
+        var normalized = normalizeSettings(remote);
+        saveLocalSettings(normalized);
+        applySettings(normalized, { persist: false, silent: silent });
+        return {
+          success: true,
+          source: "server",
+          settings: cloneSettings(normalized),
+        };
+      })
+      .catch(function (error) {
+        if (applyLocalOnFailure) {
+          var local = readSettings();
+          applySettings(local, { persist: false, silent: silent });
+        }
+
+        if (opts.throwOnError) {
+          throw error;
+        }
+
+        return {
+          success: false,
+          source: "local",
+          settings: cloneSettings(settings || readSettings()),
+          error: error && error.message ? error.message : String(error),
+        };
+      });
+  }
+
+  function saveToServer(partial, options) {
+    var opts = options || {};
+    var merged = Object.assign({}, settings || DEFAULTS, partial || {});
+    var localApplied = applySettings(merged, {
+      persist: true,
+      silent: !!opts.silent,
+    });
+
+    return requestUiConfig("POST", localApplied)
+      .then(function (payload) {
+        var remote = extractConfigPayload(payload) || localApplied;
+        var normalized = normalizeSettings(remote);
+        saveLocalSettings(normalized);
+        applySettings(normalized, { persist: false, silent: !!opts.silent });
+        return {
+          success: true,
+          source: "server",
+          settings: cloneSettings(normalized),
+        };
+      })
+      .catch(function (error) {
+        if (opts.throwOnError) {
+          throw error;
+        }
+        return {
+          success: false,
+          source: "local",
+          settings: cloneSettings(localApplied),
+          error: error && error.message ? error.message : String(error),
+        };
+      });
   }
 
   function migrateLegacySettings() {
@@ -285,7 +451,7 @@
         migrated.loginBackgroundMode = "custom";
         migrated.loginBackgroundUrl = legacyUrl;
       }
-      saveSettings(migrated);
+      saveLocalSettings(migrated);
       return migrated;
     } catch (e) {
       return null;
@@ -690,7 +856,7 @@
     }
 
     if (opts.persist) {
-      saveSettings(settings);
+      saveLocalSettings(settings);
     }
     if (!opts.silent) {
       dispatchDesignChange(settings, opts.persist);
@@ -714,7 +880,7 @@
 
   function resetSettings() {
     var fresh = normalizeSettings(DEFAULTS);
-    saveSettings(fresh);
+    saveLocalSettings(fresh);
     return applySettings(fresh, { persist: false, silent: false });
   }
 
@@ -790,6 +956,8 @@
       return cloneSettings(DEFAULTS);
     },
     setSettings: setSettings,
+    syncFromServer: syncFromServer,
+    saveToServer: saveToServer,
     previewSettings: previewSettings,
     restorePersisted: restorePersisted,
     resetSettings: resetSettings,
@@ -804,6 +972,7 @@
   settings = migrateLegacySettings() || readSettings();
   applySettings(settings, { persist: false, silent: true });
   bindGlobalListeners();
+  syncFromServer({ silent: true, applyLocalOnFailure: false });
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init, { once: true });

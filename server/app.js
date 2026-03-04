@@ -1,4 +1,6 @@
 const crypto = require('node:crypto');
+const fs = require('node:fs/promises');
+const path = require('node:path');
 const { Hono } = require('hono');
 const { cors } = require('hono/cors');
 const { createContainer } = require('./lib/container');
@@ -157,6 +159,110 @@ function createApp() {
       output[key] = value;
     }
     return output;
+  }
+
+  const UI_CONFIG_FILE_NAME = 'ui_config.json';
+  const UI_EFFECT_STYLES = new Set(['none', 'math', 'particle', 'texture']);
+  const DEFAULT_UI_CONFIG = {
+    version: 1,
+    baseColor: '#fafaf8',
+    globalBackgroundUrl: '',
+    loginBackgroundMode: 'follow-global',
+    loginBackgroundUrl: '',
+    cardOpacity: 86,
+    cardBlur: 14,
+    effectStyle: 'math',
+    effectIntensity: 22,
+    optimizeMobile: true,
+  };
+
+  function clampUiNumber(value, min, max) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return min;
+    return Math.min(max, Math.max(min, numeric));
+  }
+
+  function normalizeUiHexColor(value) {
+    const text = String(value || '').trim();
+    if (!/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(text)) {
+      return DEFAULT_UI_CONFIG.baseColor;
+    }
+    if (text.length === 4) {
+      return (
+        '#' +
+        text[1] +
+        text[1] +
+        text[2] +
+        text[2] +
+        text[3] +
+        text[3]
+      ).toLowerCase();
+    }
+    return text.toLowerCase();
+  }
+
+  function sanitizeUiUrl(url) {
+    const text = String(url || '').trim();
+    if (!text) return '';
+    if (/^(https?:)?\/\//i.test(text)) return text;
+    if (/^\//.test(text)) return text;
+    return '';
+  }
+
+  function normalizeUiConfig(raw) {
+    const next = Object.assign({}, DEFAULT_UI_CONFIG, raw || {});
+    next.baseColor = normalizeUiHexColor(next.baseColor);
+    next.globalBackgroundUrl = sanitizeUiUrl(next.globalBackgroundUrl);
+    next.loginBackgroundMode = next.loginBackgroundMode === 'custom' ? 'custom' : 'follow-global';
+    next.loginBackgroundUrl = sanitizeUiUrl(next.loginBackgroundUrl);
+    next.cardOpacity = Math.round(clampUiNumber(next.cardOpacity, 0, 100));
+    next.cardBlur = Math.round(clampUiNumber(next.cardBlur, 0, 32));
+    next.effectStyle = UI_EFFECT_STYLES.has(next.effectStyle) ? next.effectStyle : DEFAULT_UI_CONFIG.effectStyle;
+    next.effectIntensity = Math.round(clampUiNumber(next.effectIntensity, 0, 100));
+    next.optimizeMobile = next.optimizeMobile !== false;
+    return next;
+  }
+
+  function extractUiConfigPayload(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return {};
+    }
+
+    if (input.config && typeof input.config === 'object' && !Array.isArray(input.config)) {
+      return input.config;
+    }
+    if (input.settings && typeof input.settings === 'object' && !Array.isArray(input.settings)) {
+      return input.settings;
+    }
+    return input;
+  }
+
+  function resolveUiConfigPath() {
+    const dir = container.config.dataDir || path.resolve(process.cwd(), 'data');
+    return path.join(dir, UI_CONFIG_FILE_NAME);
+  }
+
+  async function readUiConfig() {
+    const filePath = resolveUiConfigPath();
+    try {
+      const raw = await fs.readFile(filePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      return normalizeUiConfig(parsed);
+    } catch (error) {
+      if (error && error.code === 'ENOENT') {
+        return normalizeUiConfig(DEFAULT_UI_CONFIG);
+      }
+      console.warn('[ui-config] failed to read config, falling back to defaults:', error?.message || error);
+      return normalizeUiConfig(DEFAULT_UI_CONFIG);
+    }
+  }
+
+  async function writeUiConfig(input) {
+    const filePath = resolveUiConfigPath();
+    const normalized = normalizeUiConfig(input);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+    return normalized;
   }
 
   function getSettingsKeyList(c) {
@@ -457,6 +563,29 @@ function createApp() {
   // Compatibility aliases
   app.get('/api/manage/settings', getSettingsHandler);
   app.post('/api/manage/settings', setSettingsHandler);
+
+  app.get('/api/ui-config', async (c) => {
+    const config = await readUiConfig();
+    return c.json({
+      success: true,
+      config,
+      source: 'file',
+    });
+  });
+
+  app.post('/api/ui-config', async (c) => {
+    const unauthorized = requireAuth(c);
+    if (unauthorized) return unauthorized;
+
+    const body = await c.req.json().catch(() => ({}));
+    const config = await writeUiConfig(extractUiConfigPayload(body));
+
+    return c.json({
+      success: true,
+      config,
+      source: 'file',
+    });
+  });
 
   // --- Storage configs ---
   app.get('/api/storage/list', (c) => {
