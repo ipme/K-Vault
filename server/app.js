@@ -7,6 +7,18 @@ const { createContainer } = require('./lib/container');
 const { normalizeFolderPath } = require('./lib/repos/file-repo');
 const { toStorageErrorPayload } = require('./lib/utils/storage-error');
 const { createShareSignature, verifyShareSignature } = require('./lib/utils/share-link');
+const {
+  getTelegramFileFromMessage,
+  createSignedTelegramFileId,
+  parseSignedTelegramFileId,
+  shouldUseSignedTelegramLinks,
+  shouldWriteTelegramMetadata,
+  buildTelegramDirectLink,
+  sendTelegramUploadNotice,
+  buildTelegramBotApiUrl,
+  buildTelegramFileUrl,
+  getFileLinkSecrets,
+} = require('./lib/utils/telegram-webhook');
 
 function createApp() {
   const app = new Hono();
@@ -358,6 +370,61 @@ function createApp() {
     }
 
     return headers;
+  }
+
+  async function handleSignedTelegramFile(id, range, storageRepo, c, headOnly = false) {
+    const env = { ...process.env, FILE_URL_SECRET: container.config.configEncryptionKey };
+    const parsed = parseSignedTelegramFileId(id, env);
+    if (!parsed?.fileId) {
+      return c.text('Invalid or expired signed file link.', 403);
+    }
+
+    // Resolve Telegram storage config
+    const telegramConfigs = storageRepo.findEnabledByType('telegram');
+    let tgConfig = telegramConfigs[0]?.config;
+    if (!tgConfig?.botToken) {
+      const bootstrap = container.config.bootstrapDefaultStorage?.telegram;
+      if (bootstrap?.botToken) tgConfig = bootstrap;
+    }
+    if (!tgConfig?.botToken) {
+      return c.text('Telegram storage not configured.', 500);
+    }
+
+    const { TelegramStorageAdapter } = require('./lib/storage/adapters/telegram');
+    const adapter = new TelegramStorageAdapter({
+      botToken: tgConfig.botToken,
+      chatId: tgConfig.chatId,
+      apiBase: tgConfig.apiBase || container.config.telegramApiBase,
+    });
+
+    const upstream = await adapter.download({
+      storageKey: parsed.fileId,
+      metadata: { telegramFileId: parsed.fileId },
+      range,
+    });
+
+    if (!upstream) {
+      return c.text('File not found on Telegram.', 404);
+    }
+
+    const headers = new Headers(upstream.headers);
+    headers.set('Access-Control-Allow-Origin', '*');
+    headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Disposition');
+    headers.set('Cache-Control', 'no-store, max-age=0');
+    if (!headers.get('content-type') && parsed.mimeType) {
+      headers.set('Content-Type', parsed.mimeType);
+    }
+    if (!headers.get('content-disposition')) {
+      const safeName = encodeURIComponent(parsed.fileName || `${parsed.fileId}.${parsed.fileExtension}`);
+      headers.set('Content-Disposition', `inline; filename="${safeName}"; filename*=UTF-8''${safeName}`);
+    }
+
+    if (headOnly) {
+      return new Response(null, { status: upstream.status, statusText: upstream.statusText, headers });
+    }
+
+    return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
   }
 
   function parseShareExpiry(value, fallbackSeconds = 7 * 24 * 60 * 60) {
@@ -1118,9 +1185,19 @@ function createApp() {
   });
 
   app.get('/file/:id', async (c) => {
-    const { uploadService } = getServices(c);
+    const { uploadService, storageRepo } = getServices(c);
     const id = decodeURIComponent(c.req.param('id'));
     const range = c.req.header('range');
+
+    // Handle signed Telegram file IDs (tgs_ prefix)
+    if (id.startsWith('tgs_')) {
+      try {
+        return await handleSignedTelegramFile(id, range, storageRepo, c);
+      } catch (error) {
+        console.error('signed telegram file proxy error:', error);
+        return c.text(`Signed file proxy error: ${error?.message || 'Unknown error'}`, 502);
+      }
+    }
 
     try {
       const result = await uploadService.getFileResponse(id, range);
@@ -1144,9 +1221,18 @@ function createApp() {
 
   app.options('/file/:id', (c) => c.body(null, 204));
   app.on('HEAD', '/file/:id', async (c) => {
-    const { uploadService } = getServices(c);
+    const { uploadService, storageRepo } = getServices(c);
     const id = decodeURIComponent(c.req.param('id'));
     const range = c.req.header('range');
+
+    if (id.startsWith('tgs_')) {
+      try {
+        return await handleSignedTelegramFile(id, range, storageRepo, c, true);
+      } catch (error) {
+        console.error('signed telegram file HEAD error:', error);
+        return c.body(null, 502);
+      }
+    }
 
     try {
       const result = await uploadService.getFileResponse(id, range);
@@ -1680,8 +1766,141 @@ function createApp() {
   });
 
   app.post('/api/telegram/webhook', async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    return c.json({ success: true, received: Boolean(body) });
+    const { storageRepo } = getServices(c);
+
+    // Resolve Telegram storage config (from DB or env bootstrap)
+    const telegramConfig = (() => {
+      const dbConfig = storageRepo.findEnabledByType('telegram')[0];
+      if (dbConfig?.config?.botToken && dbConfig?.config?.chatId) {
+        return {
+          botToken: dbConfig.config.botToken,
+          chatId: dbConfig.config.chatId,
+          apiBase: dbConfig.config.apiBase || container.config.telegramApiBase,
+        };
+      }
+      const bootstrap = container.config.bootstrapDefaultStorage?.telegram;
+      if (bootstrap?.botToken && bootstrap?.chatId) {
+        return { botToken: bootstrap.botToken, chatId: bootstrap.chatId, apiBase: bootstrap.apiBase };
+      }
+      return null;
+    })();
+
+    if (!telegramConfig?.botToken) {
+      return c.json({ ok: false, error: 'No Telegram bot token configured.' }, 500);
+    }
+
+    // Build env-like object for utility functions
+    const env = {
+      ...process.env,
+      TG_Bot_Token: telegramConfig.botToken,
+      TG_Chat_ID: telegramConfig.chatId,
+      CUSTOM_BOT_API_URL: telegramConfig.apiBase,
+      PUBLIC_BASE_URL: container.config.publicBaseUrl,
+      FILE_URL_SECRET: container.config.configEncryptionKey,
+    };
+
+    // Verify webhook secret if configured
+    const expectedSecret = env.TG_WEBHOOK_SECRET || env.TELEGRAM_WEBHOOK_SECRET;
+    if (expectedSecret) {
+      const headerSecret = c.req.header('X-Telegram-Bot-Api-Secret-Token') || '';
+      if (headerSecret !== expectedSecret) {
+        return c.json({ ok: false, error: 'Invalid webhook secret.' }, 401);
+      }
+    }
+
+    let update;
+    try {
+      update = await c.req.json();
+    } catch {
+      return c.json({ ok: false, error: 'Invalid JSON body.' }, 400);
+    }
+
+    const message = update?.message || update?.channel_post;
+    if (!message) {
+      return c.json({ ok: true, ignored: 'no-message' });
+    }
+
+    const media = getTelegramFileFromMessage(message);
+    if (!media) {
+      return c.json({ ok: true, ignored: 'message-without-file' });
+    }
+
+    const useSigned = shouldUseSignedTelegramLinks(env);
+    const directId = useSigned
+      ? createSignedTelegramFileId(
+          {
+            fileId: media.fileId,
+            fileExtension: media.fileExtension,
+            fileName: media.fileName,
+            mimeType: media.mimeType,
+            fileSize: media.fileSize,
+            messageId: media.messageId,
+          },
+          env
+        )
+      : `${media.fileId}.${media.fileExtension}`;
+
+    // Store file metadata in SQLite if enabled
+    if (shouldWriteTelegramMetadata(env)) {
+      try {
+        const { fileRepo } = getServices(c);
+        const publicId = `${media.fileId}.${media.fileExtension}`;
+        const existing = fileRepo.getById(publicId);
+        if (!existing) {
+          fileRepo.create({
+            id: publicId,
+            storageConfigId: 'telegram-webhook',
+            storageType: 'telegram',
+            storageKey: media.fileId,
+            fileName: media.fileName,
+            fileSize: media.fileSize,
+            mimeType: media.mimeType,
+            folderPath: '',
+            extra: {
+              fromWebhook: true,
+              signedLink: useSigned,
+              telegramFileId: media.fileId,
+              telegramMessageId: media.messageId || undefined,
+            },
+          });
+        }
+      } catch (dbErr) {
+        console.error('[telegram-webhook] metadata store error:', dbErr.message);
+      }
+    }
+
+    const requestUrl = new URL(c.req.url);
+    const origin = `${requestUrl.protocol}//${requestUrl.host}`;
+    const directLink = buildTelegramDirectLink(env, directId, origin);
+    const chatId = message?.chat?.id;
+
+    if (chatId) {
+      const noticeResult = await sendTelegramUploadNotice(
+        {
+          chatId,
+          replyToMessageId: message.message_id,
+          directLink,
+          fileId: media.fileId,
+          messageId: media.messageId || message.message_id,
+          fileName: media.fileName,
+          fileSize: media.fileSize,
+        },
+        env
+      );
+      if (!noticeResult?.ok && !noticeResult?.skipped) {
+        console.warn(
+          '[telegram-webhook] reply failed:',
+          noticeResult?.data?.description || noticeResult?.error || 'unknown error'
+        );
+      }
+    }
+
+    return c.json({
+      ok: true,
+      directLink,
+      storageType: 'telegram',
+      mode: useSigned ? 'signed' : 'direct',
+    });
   });
 
   app.get('/api/health', (c) => {
