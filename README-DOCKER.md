@@ -133,7 +133,7 @@ curl -i -X POST "http://localhost:8080/api/auth/login" \
   - 存储后端：Telegram / R2 / S3 / Discord / HuggingFace / WebDAV / GitHub
 - `web`：Nginx 静态托管 + 反代
   - `/api/*` -> `api:8787`
-  - `/upload` -> `api:8787/upload`
+  - `GET /upload` -> 根目录上传页，`POST /upload` -> `api:8787/upload`
   - `/file/*`、`/share/*` -> `api:8787`
   - `/` -> 根目录静态页面
 
